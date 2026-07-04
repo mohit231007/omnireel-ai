@@ -174,7 +174,7 @@ def _run_command(command: Sequence[str], cwd: Path, label: str) -> None:
 def _manifest_from_json(path: Path) -> AssetManifest:
     import json
 
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))
     required = ["output_dir", "plan_json", "base_image", "audio", "raw_video", "subtitles_json", "final_video", "fps"]
     missing = [key for key in required if key not in payload]
     if missing:
