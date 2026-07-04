@@ -27,6 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--guidance-scale", type=float, default=7.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--fps", type=float, default=30.0)
+    parser.add_argument("--qa-static-assets", action="store_true")
     parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--rust-binary", type=Path, default=None)
     parser.add_argument("--debug-rust", action="store_true")
@@ -49,10 +50,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     configure_logging(args.log_level)
 
     if not args.skip_python_generation:
-        if args.diffusion_model is None:
-            parser.error("--diffusion-model is required unless --skip-python-generation is used")
-        if not args.liveportrait_cmd:
-            parser.error("--liveportrait-cmd is required unless --skip-python-generation is used")
+        if not args.qa_static_assets:
+            if args.diffusion_model is None:
+                parser.error("--diffusion-model is required unless --skip-python-generation or --qa-static-assets is used")
+            if not args.liveportrait_cmd:
+                parser.error("--liveportrait-cmd is required unless --skip-python-generation or --qa-static-assets is used")
     elif args.existing_manifest is None:
         parser.error("--existing-manifest is required when --skip-python-generation is used")
 
@@ -74,6 +76,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             seed=args.seed,
             fps=args.fps,
             allow_remote_backends=False,
+            qa_static_assets=args.qa_static_assets,
         )
         orchestrator_config = OrchestratorConfig(
             pipeline=pipeline_config,
