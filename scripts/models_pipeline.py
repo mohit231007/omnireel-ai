@@ -63,6 +63,7 @@ class PipelineConfig:
     seed: Optional[int] = 42
     fps: float = 30.0
     allow_remote_backends: bool = False
+    qa_static_assets: bool = False
 
 
 @dataclass(frozen=True)
@@ -115,11 +116,20 @@ class OmniReelPipeline:
         if self.config.tts_backend == "piper" and not self.config.piper_cmd:
             raise OmniReelError("tts_backend='piper' requires piper_cmd with {text_file} and {output} tokens.")
 
+        if self.config.qa_static_assets:
+            LOGGER.warning(
+                "qa_static_assets=True: using local Pillow/FFmpeg fallback assets instead of Diffusers/LivePortrait. "
+                "This is intended for pipeline QA when model weights are not available locally."
+            )
+            return
+
         if not self.config.diffusion_model_path.exists():
             raise FileNotFoundError(
                 f"Diffusion model path does not exist: {self.config.diffusion_model_path}. "
                 "Download/copy weights locally first; this pipeline will not fetch them."
             )
+        if not self.config.liveportrait_cmd.strip():
+            raise OmniReelError("liveportrait_cmd is required unless qa_static_assets=True.")
 
     def purge_vram(self, label: str) -> None:
         """Aggressively release Python and CUDA memory between heavyweight steps."""
@@ -145,7 +155,7 @@ class OmniReelPipeline:
         self.purge_vram("ollama_scene_plan")
 
         base_image = self.generate_base_image(scene_plan)
-        self.purge_vram("diffusers_base_image")
+        self.purge_vram("base_image")
 
         audio_path = self.synthesize_dialogue(scene_plan.dialogue)
         self.purge_vram("tts_audio")
@@ -206,7 +216,7 @@ class OmniReelPipeline:
                 f"and the model is pulled: {self.config.ollama_model}"
             ) from exc
 
-        content = response.get("message", {}).get("content", "") if isinstance(response, dict) else ""
+        content = _extract_ollama_content(response)
         payload = _parse_json_object(content)
         return _validate_scene_plan(payload)
 
@@ -217,7 +227,10 @@ class OmniReelPipeline:
         return plan_path
 
     def generate_base_image(self, scene_plan: ScenePlan) -> Path:
-        """Generate a static base image from local Diffusers weights."""
+        """Generate a static base image from local Diffusers weights or QA fallback."""
+        if self.config.qa_static_assets:
+            return self._generate_static_qa_image(scene_plan)
+
         LOGGER.info("Loading local Diffusers pipeline from %s", self.config.diffusion_model_path)
         import torch
         from diffusers import DiffusionPipeline
@@ -279,6 +292,48 @@ class OmniReelPipeline:
                 del pipe
             self.purge_vram("diffusers_cleanup")
 
+    def _generate_static_qa_image(self, scene_plan: ScenePlan) -> Path:
+        """Create a deterministic local image without network/model weights for QA."""
+        from PIL import Image, ImageDraw, ImageFont
+
+        output_path = self.config.output_dir / "base_image.png"
+        width = max(320, int(self.config.width))
+        height = max(320, int(self.config.height))
+        image = Image.new("RGB", (width, height), color=(28, 32, 40))
+        draw = ImageDraw.Draw(image)
+
+        title_font = _load_pillow_font(ImageFont, self.config.font_path, max(24, width // 20))
+        body_font = _load_pillow_font(ImageFont, self.config.font_path, max(16, width // 34))
+        small_font = _load_pillow_font(ImageFont, self.config.font_path, max(13, width // 44))
+
+        draw.rectangle([(0, 0), (width, height)], fill=(28, 32, 40))
+        draw.rectangle([(0, 0), (width, int(height * 0.16))], fill=(45, 56, 76))
+        draw.rectangle([(int(width * 0.08), int(height * 0.24)), (int(width * 0.92), int(height * 0.64))], outline=(120, 180, 255), width=4)
+
+        title_lines = _wrap_for_pillow(draw, scene_plan.title, title_font, int(width * 0.84))
+        y = int(height * 0.05)
+        for line in title_lines[:2]:
+            draw.text((int(width * 0.08), y), line, font=title_font, fill=(255, 255, 255))
+            y += _font_line_height(title_font) + 8
+
+        prompt = scene_plan.visual_prompt or scene_plan.style_notes
+        prompt_lines = _wrap_for_pillow(draw, prompt, body_font, int(width * 0.74))
+        y = int(height * 0.30)
+        for line in prompt_lines[:7]:
+            draw.text((int(width * 0.13), y), line, font=body_font, fill=(228, 238, 255))
+            y += _font_line_height(body_font) + 8
+
+        footer = "OmniReel QA static local image | Replace with local Diffusers model for production"
+        footer_lines = _wrap_for_pillow(draw, footer, small_font, int(width * 0.84))
+        y = int(height * 0.86)
+        for line in footer_lines[:2]:
+            draw.text((int(width * 0.08), y), line, font=small_font, fill=(180, 190, 205))
+            y += _font_line_height(small_font) + 6
+
+        image.save(output_path)
+        LOGGER.info("QA static base image written: %s", output_path)
+        return output_path
+
     def synthesize_dialogue(self, dialogue: str) -> Path:
         """Synthesize narration with an offline TTS backend."""
         clean_dialogue = _normalize_text(dialogue)
@@ -323,16 +378,49 @@ class OmniReelPipeline:
         _run_local_command(command, "Piper offline TTS")
 
     def animate(self, image_path: Path, audio_path: Path) -> Path:
-        """Run a local LivePortrait-compatible CLI to generate a raw talking-head video."""
+        """Run local animation or deterministic FFmpeg static-video fallback."""
         _assert_file(image_path, "base image")
         _assert_file(audio_path, "dialogue audio")
         raw_video = self.config.output_dir / "raw_animated.mp4"
-        command = _format_command(
-            self.config.liveportrait_cmd,
-            {"image": image_path, "audio": audio_path, "output": raw_video},
-        )
-        LOGGER.info("Running local animation command.")
-        _run_local_command(command, "LivePortrait/local animation")
+
+        if self.config.qa_static_assets:
+            command = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-loop",
+                "1",
+                "-framerate",
+                str(self.config.fps),
+                "-i",
+                str(image_path),
+                "-i",
+                str(audio_path),
+                "-c:v",
+                "libx264",
+                "-tune",
+                "stillimage",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-pix_fmt",
+                "yuv420p",
+                "-shortest",
+                str(raw_video),
+            ]
+            LOGGER.info("Running FFmpeg static-video QA animation fallback.")
+            _run_local_command(command, "FFmpeg static QA animation")
+        else:
+            command = _format_command(
+                self.config.liveportrait_cmd,
+                {"image": image_path, "audio": audio_path, "output": raw_video},
+            )
+            LOGGER.info("Running local animation command.")
+            _run_local_command(command, "LivePortrait/local animation")
+
         _assert_file(raw_video, "raw animated video")
         return raw_video
 
@@ -363,6 +451,20 @@ class OmniReelPipeline:
 
 def _is_loopback_url(url: str) -> bool:
     return bool(re.match(r"^https?://(127\.0\.0\.1|localhost|\[::1\])(?::\d+)?/?", url))
+
+
+def _extract_ollama_content(response: Any) -> str:
+    if isinstance(response, dict):
+        message = response.get("message", {})
+        return str(message.get("content", ""))
+
+    message = getattr(response, "message", None)
+    if isinstance(message, dict):
+        return str(message.get("content", ""))
+    if message is not None and hasattr(message, "content"):
+        return str(message.content)
+
+    raise OmniReelError("Could not extract message content from Ollama response.")
 
 
 def _parse_json_object(content: str) -> Dict[str, Any]:
@@ -424,6 +526,55 @@ def _build_int8_kwargs() -> Dict[str, Any]:
         ) from exc
 
     return {"quantization_config": BitsAndBytesConfig(load_in_8bit=True), "device_map": "balanced"}
+
+
+def _load_pillow_font(image_font_module: Any, font_path: Optional[Path], size: int) -> Any:
+    candidates = []
+    if font_path:
+        candidates.append(font_path)
+    if os.name == "nt":
+        candidates.extend([Path("C:/Windows/Fonts/arial.ttf"), Path("C:/Windows/Fonts/segoeui.ttf")])
+    candidates.extend([
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+        Path("/Library/Fonts/Arial.ttf"),
+    ])
+
+    for candidate in candidates:
+        try:
+            if candidate.exists():
+                return image_font_module.truetype(str(candidate), size=size)
+        except Exception:
+            continue
+    return image_font_module.load_default()
+
+
+def _font_line_height(font: Any) -> int:
+    try:
+        bbox = font.getbbox("Ag")
+        return int((bbox[3] - bbox[1]) * 1.25)
+    except Exception:
+        return 24
+
+
+def _wrap_for_pillow(draw: Any, text: str, font: Any, max_width: int) -> List[str]:
+    words = _normalize_text(text).split()
+    if not words:
+        return []
+
+    lines: List[str] = []
+    current = ""
+    for word in words:
+        candidate = word if not current else f"{current} {word}"
+        bbox = draw.textbbox((0, 0), candidate, font=font)
+        width = bbox[2] - bbox[0]
+        if width <= max_width or not current:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines
 
 
 def _normalize_text(text: str) -> str:
