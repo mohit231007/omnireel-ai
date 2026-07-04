@@ -188,7 +188,7 @@ class OmniReelPipeline:
         return manifest
 
     def generate_scene_plan(self, topic: str) -> ScenePlan:
-        """Ask a local Ollama model for a strict JSON scene plan."""
+        """Ask a local Ollama model for a strict JSON scene plan with a deterministic local fallback."""
         if not topic.strip():
             raise ValueError("topic must not be empty.")
 
@@ -196,16 +196,14 @@ class OmniReelPipeline:
 
         dialogue_budget = max(6, min(16, int(self.config.duration_seconds * 2.7)))
         system_prompt = (
-            "You are OmniReel AI, a local video planning engine. Return compact valid JSON only. "
-            "No markdown, no commentary, no reasoning. Required keys: "
-            "title, visual_prompt, negative_prompt, dialogue, style_notes. "
+            "Return compact valid JSON only. No markdown. No commentary. No reasoning. "
+            "Required keys: title, visual_prompt, negative_prompt, dialogue, style_notes. "
             f"Dialogue must be under {dialogue_budget} words and fit a {self.config.duration_seconds:.1f} second video."
         )
         user_prompt = (
             f"Topic: {topic.strip()}\n"
             "Create one concrete visual scene with visible movement. "
-            "For gravity, prefer a falling apple or ball. For space, prefer orbiting planets. "
-            "Keep the narration extremely short."
+            "For gravity, use a red apple falling down. Keep narration very short."
         )
 
         LOGGER.info("Calling local Ollama model=%s for scene planning", self.config.ollama_model)
@@ -218,17 +216,16 @@ class OmniReelPipeline:
                     {"role": "user", "content": user_prompt},
                 ],
                 format="json",
-                options={"temperature": 0.1, "num_ctx": 1024, "num_predict": 180},
+                options={"temperature": 0.1, "num_ctx": 1024, "num_predict": 220},
             )
+            content = _extract_ollama_content(response)
+            if not content.strip():
+                raise OmniReelError("Ollama returned an empty planning response.")
+            payload = _parse_json_object(content)
+            return _validate_scene_plan(payload)
         except Exception as exc:
-            raise OmniReelError(
-                "Local Ollama call failed. Ensure Ollama is installed, running locally, "
-                f"and the model is pulled: {self.config.ollama_model}"
-            ) from exc
-
-        content = _extract_ollama_content(response)
-        payload = _parse_json_object(content)
-        return _validate_scene_plan(payload)
+            LOGGER.warning("Local Ollama planning failed or returned invalid JSON; using deterministic local fallback. Error: %s", exc)
+            return _fallback_scene_plan(topic, self.config.duration_seconds)
 
     def _write_scene_plan(self, scene_plan: ScenePlan) -> Path:
         plan_path = self.config.output_dir / "scene_plan.json"
@@ -446,7 +443,6 @@ class OmniReelPipeline:
         title_font = _load_pillow_font(image_font_module, self.config.font_path, max(26, width // 22))
         small_font = _load_pillow_font(image_font_module, self.config.font_path, max(16, width // 46))
 
-        # Classroom background with parallax-like motion lines.
         draw.rectangle([(0, 0), (width, height)], fill=(21, 29, 38))
         draw.rectangle([(0, int(height * 0.72)), (width, height)], fill=(54, 39, 28))
         for x in range(-width, width * 2, max(80, width // 8)):
@@ -459,7 +455,6 @@ class OmniReelPipeline:
         for line_index, line in enumerate(_wrap_for_pillow(draw, title, title_font, int(width * 0.74))[:2]):
             draw.text((board[0] + 28, board[1] + 24 + line_index * (title_font.size + 8)), line, font=title_font, fill=(245, 255, 235))
 
-        # Simple teacher/kid figure.
         cx = int(width * 0.22)
         body_y = int(height * 0.62)
         draw.ellipse([(cx - 42, body_y - 180), (cx + 42, body_y - 96)], fill=(178, 122, 75), outline=(40, 30, 25), width=2)
@@ -467,7 +462,6 @@ class OmniReelPipeline:
         arm_angle = math.sin(progress * math.pi * 2) * 0.25
         draw.line([(cx + 36, body_y - 55), (int(cx + width * 0.18), int(body_y - 120 + 40 * arm_angle))], fill=(178, 122, 75), width=12)
 
-        # Apple falling with acceleration, trail, and bounce hint.
         top_y = int(height * 0.23)
         bottom_y = int(height * 0.70)
         fall = progress * progress
@@ -553,6 +547,34 @@ class OmniReelPipeline:
 
 def _is_loopback_url(url: str) -> bool:
     return bool(re.match(r"^https?://(127\.0\.0\.1|localhost|\[::1\])(?::\d+)?/?", url))
+
+
+def _fallback_scene_plan(topic: str, duration_seconds: float) -> ScenePlan:
+    topic_norm = _normalize_text(topic)
+    theme = topic_norm.lower()
+    if any(word in theme for word in ["gravity", "apple", "fall"]):
+        return ScenePlan(
+            title="Gravity Makes Things Fall",
+            visual_prompt="A red apple falling from a tree toward the ground in a simple classroom science animation.",
+            negative_prompt="blurry, unreadable, low quality, distorted",
+            dialogue="Gravity pulls the apple down.",
+            style_notes=f"Short {duration_seconds:.1f} second motion demo with a falling apple and minimal text.",
+        )
+    if any(word in theme for word in ["planet", "orbit", "space", "sun"]):
+        return ScenePlan(
+            title="Planets Move in Orbits",
+            visual_prompt="Planets moving around the sun in a simple space science animation.",
+            negative_prompt="blurry, unreadable, low quality, distorted",
+            dialogue="Planets move around the sun.",
+            style_notes=f"Short {duration_seconds:.1f} second orbit motion demo with minimal text.",
+        )
+    return ScenePlan(
+        title="Quick Science Motion",
+        visual_prompt=f"A simple moving object animation explaining: {topic_norm}",
+        negative_prompt="blurry, unreadable, low quality, distorted",
+        dialogue="Watch how it moves.",
+        style_notes=f"Short {duration_seconds:.1f} second motion demo with minimal text.",
+    )
 
 
 def _extract_ollama_content(response: Any) -> str:
