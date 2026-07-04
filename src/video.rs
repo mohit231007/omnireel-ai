@@ -35,8 +35,9 @@ impl VideoJob {
         assert_existing_file(&self.input_video, "input video")?;
         assert_existing_file(&self.audio, "audio")?;
         if let Some(parent) = self.output.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create output directory {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create output directory {}", parent.display())
+            })?;
         }
         if !(0..=51).contains(&self.crf) {
             bail!("crf must be between 0 and 51, got {}", self.crf);
@@ -73,7 +74,10 @@ pub fn render_subtitled_video(job: &VideoJob, renderer: &SubtitleRenderer) -> Re
     decode_frames(&job.input_video, &decoded_dir)?;
     let frames = list_png_frames(&decoded_dir)?;
     if frames.is_empty() {
-        bail!("ffmpeg decoded zero frames from {}", job.input_video.display());
+        bail!(
+            "ffmpeg decoded zero frames from {}",
+            job.input_video.display()
+        );
     }
     info!("Decoded {} frames", frames.len());
 
@@ -113,18 +117,27 @@ fn decode_frames(input_video: &Path, decoded_dir: &Path) -> Result<()> {
     run_command(&mut command, "decode video frames").map(|_| ())
 }
 
-fn render_frames_parallel(frames: &[PathBuf], rendered_dir: &Path, renderer: &SubtitleRenderer) -> Result<()> {
-    frames.par_iter().enumerate().try_for_each(|(index, frame_path)| -> Result<()> {
-        let mut image = image::open(frame_path)
-            .with_context(|| format!("failed to open decoded frame {}", frame_path.display()))?
-            .to_rgba8();
-        renderer.render_frame(&mut image, index as u64);
-        let output_path = rendered_dir.join(format!("frame_{:08}.png", index + 1));
-        image
-            .save_with_format(&output_path, ImageFormat::Png)
-            .with_context(|| format!("failed to save rendered frame {}", output_path.display()))?;
-        Ok(())
-    })
+fn render_frames_parallel(
+    frames: &[PathBuf],
+    rendered_dir: &Path,
+    renderer: &SubtitleRenderer,
+) -> Result<()> {
+    frames
+        .par_iter()
+        .enumerate()
+        .try_for_each(|(index, frame_path)| -> Result<()> {
+            let mut image = image::open(frame_path)
+                .with_context(|| format!("failed to open decoded frame {}", frame_path.display()))?
+                .to_rgba8();
+            renderer.render_frame(&mut image, index as u64);
+            let output_path = rendered_dir.join(format!("frame_{:08}.png", index + 1));
+            image
+                .save_with_format(&output_path, ImageFormat::Png)
+                .with_context(|| {
+                    format!("failed to save rendered frame {}", output_path.display())
+                })?;
+            Ok(())
+        })
 }
 
 fn encode_frames(rendered_dir: &Path, fps: f64, crf: u8, output: &Path) -> Result<()> {
@@ -192,16 +205,21 @@ fn probe_fps(input_video: &Path) -> Result<f64> {
         .arg("default=noprint_wrappers=1:nokey=1")
         .arg(input_video);
     let stdout = run_command(&mut command, "probe video fps")?;
-    parse_fps(stdout.trim()).ok_or_else(|| anyhow!("could not parse fps value from ffprobe output: {stdout:?}"))
+    parse_fps(stdout.trim())
+        .ok_or_else(|| anyhow!("could not parse fps value from ffprobe output: {stdout:?}"))
 }
 
 fn parse_fps(raw: &str) -> Option<f64> {
     let value = raw.trim();
-    if value.is_empty() { return None; }
+    if value.is_empty() {
+        return None;
+    }
     if let Some((num, den)) = value.split_once('/') {
         let numerator: f64 = num.parse().ok()?;
         let denominator: f64 = den.parse().ok()?;
-        if denominator == 0.0 { return None; }
+        if denominator == 0.0 {
+            return None;
+        }
         return Some(numerator / denominator);
     }
     value.parse::<f64>().ok()
@@ -211,22 +229,35 @@ fn list_png_frames(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut frames: Vec<PathBuf> = fs::read_dir(dir)
         .with_context(|| format!("failed to read frame directory {}", dir.display()))?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.extension().and_then(|extension| extension.to_str()).map(|extension| extension.eq_ignore_ascii_case("png")).unwrap_or(false))
+        .filter(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .map(|extension| extension.eq_ignore_ascii_case("png"))
+                .unwrap_or(false)
+        })
         .collect();
     frames.sort();
     Ok(frames)
 }
 
 fn assert_existing_file(path: &Path, label: &str) -> Result<()> {
-    if !path.exists() { bail!("{label} does not exist: {}", path.display()); }
-    if !path.is_file() { bail!("{label} is not a file: {}", path.display()); }
-    if path.metadata()?.len() == 0 { bail!("{label} is empty: {}", path.display()); }
+    if !path.exists() {
+        bail!("{label} does not exist: {}", path.display());
+    }
+    if !path.is_file() {
+        bail!("{label} is not a file: {}", path.display());
+    }
+    if path.metadata()?.len() == 0 {
+        bail!("{label} is empty: {}", path.display());
+    }
     Ok(())
 }
 
 fn run_command(command: &mut Command, label: &str) -> Result<String> {
     debug!("Running {label}: {:?}", command);
-    let output = command.output().with_context(|| format!("failed to execute {label}"))?;
+    let output = command
+        .output()
+        .with_context(|| format!("failed to execute {label}"))?;
 
     if !output.status.success() {
         bail!(
@@ -241,7 +272,11 @@ fn run_command(command: &mut Command, label: &str) -> Result<String> {
 }
 
 fn format_fps(fps: f64) -> String {
-    if fps.fract().abs() < f64::EPSILON { format!("{}", fps as u64) } else { format!("{fps:.3}") }
+    if fps.fract().abs() < f64::EPSILON {
+        format!("{}", fps as u64)
+    } else {
+        format!("{fps:.3}")
+    }
 }
 
 #[cfg(test)]
