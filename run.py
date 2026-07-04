@@ -1,3 +1,3 @@
-from scripts.orchestrator import OmniReelOrchestrator
+import scripts.cli as cli
 
-print('Use scripts/orchestrator.py or python -m scripts.orchestrator')
+cli.main()
