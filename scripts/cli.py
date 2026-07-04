@@ -29,6 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--duration-seconds", type=float, default=3.0)
     parser.add_argument("--qa-static-assets", action="store_true")
+    parser.add_argument("--no-llm-planning", action="store_true")
     parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--rust-binary", type=Path, default=None)
     parser.add_argument("--debug-rust", action="store_true")
@@ -79,6 +80,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             duration_seconds=args.duration_seconds,
             allow_remote_backends=False,
             qa_static_assets=args.qa_static_assets,
+            no_llm_planning=args.no_llm_planning,
         )
         orchestrator_config = OrchestratorConfig(
             pipeline=pipeline_config,
