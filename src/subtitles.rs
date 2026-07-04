@@ -94,7 +94,8 @@ impl SubtitleRenderer {
 
         let json = fs::read_to_string(path)
             .with_context(|| format!("failed to read subtitle JSON {}", path.display()))?;
-        let doc: WhisperDocument = serde_json::from_str(&json).with_context(|| {
+        let json = json.trim_start_matches('\u{feff}');
+        let doc: WhisperDocument = serde_json::from_str(json).with_context(|| {
             format!("failed to parse Whisper-compatible JSON {}", path.display())
         })?;
         let cues = cues_from_whisper(doc, fps)?;
