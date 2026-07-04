@@ -27,6 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--guidance-scale", type=float, default=7.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--fps", type=float, default=30.0)
+    parser.add_argument("--duration-seconds", type=float, default=3.0)
     parser.add_argument("--qa-static-assets", action="store_true")
     parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--rust-binary", type=Path, default=None)
@@ -75,6 +76,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             guidance_scale=args.guidance_scale,
             seed=args.seed,
             fps=args.fps,
+            duration_seconds=args.duration_seconds,
             allow_remote_backends=False,
             qa_static_assets=args.qa_static_assets,
         )
