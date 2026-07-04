@@ -4,11 +4,12 @@ Python owns model orchestration only:
 - Local LLM planning through Ollama.
 - Local Diffusers image generation from an already-downloaded model path.
 - Offline TTS through pyttsx3 or a user-provided Piper command.
-- Local animation through a user-provided LivePortrait-compatible command.
+- Local animation through either a user-provided command or a deterministic
+  procedural motion backend for local product demos.
 - Optional local Whisper/whisper.cpp timestamp extraction.
 
-No remote APIs are called by this module. Any backend that requires a network service
-is either rejected or treated as a locality violation.
+No remote APIs are called by this module. Any backend that requires a network
+service is either rejected or treated as a locality violation.
 """
 
 from __future__ import annotations
@@ -16,10 +17,12 @@ from __future__ import annotations
 import gc
 import json
 import logging
+import math
 import os
 import re
 import shlex
 import subprocess
+import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -62,6 +65,7 @@ class PipelineConfig:
     guidance_scale: float = 7.0
     seed: Optional[int] = 42
     fps: float = 30.0
+    duration_seconds: float = 3.0
     allow_remote_backends: bool = False
     qa_static_assets: bool = False
 
@@ -116,10 +120,13 @@ class OmniReelPipeline:
         if self.config.tts_backend == "piper" and not self.config.piper_cmd:
             raise OmniReelError("tts_backend='piper' requires piper_cmd with {text_file} and {output} tokens.")
 
+        if self.config.duration_seconds <= 0.5 or self.config.duration_seconds > 30:
+            raise ValueError("duration_seconds must be between 0.5 and 30 seconds.")
+
         if self.config.qa_static_assets:
             LOGGER.warning(
-                "qa_static_assets=True: using local Pillow/FFmpeg fallback assets instead of Diffusers/LivePortrait. "
-                "This is intended for pipeline QA when model weights are not available locally."
+                "qa_static_assets=True: using the local procedural motion backend. "
+                "This creates real visible motion without external model weights, but it is still a deterministic QA/demo backend."
             )
             return
 
@@ -160,7 +167,7 @@ class OmniReelPipeline:
         audio_path = self.synthesize_dialogue(scene_plan.dialogue)
         self.purge_vram("tts_audio")
 
-        raw_video = self.animate(base_image, audio_path)
+        raw_video = self.animate(base_image, audio_path, scene_plan)
         self.purge_vram("local_animation")
 
         subtitles_json = self.generate_subtitle_timings(scene_plan.dialogue, audio_path)
@@ -187,15 +194,18 @@ class OmniReelPipeline:
 
         import ollama
 
+        dialogue_budget = max(6, min(16, int(self.config.duration_seconds * 2.7)))
         system_prompt = (
-            "You are OmniReel AI, a local video planning engine. "
-            "Return only valid JSON with keys: title, visual_prompt, negative_prompt, dialogue, style_notes. "
-            "No markdown, no commentary, no code fences. Keep dialogue under 80 words."
+            "You are OmniReel AI, a local video planning engine. Return compact valid JSON only. "
+            "No markdown, no commentary, no reasoning. Required keys: "
+            "title, visual_prompt, negative_prompt, dialogue, style_notes. "
+            f"Dialogue must be under {dialogue_budget} words and fit a {self.config.duration_seconds:.1f} second video."
         )
         user_prompt = (
-            f"Create a short educational/social video scene for this topic: {topic.strip()}\n"
-            "The visual prompt must describe one clear character/scene suitable for image generation. "
-            "The dialogue must be natural spoken narration."
+            f"Topic: {topic.strip()}\n"
+            "Create one concrete visual scene with visible movement. "
+            "For gravity, prefer a falling apple or ball. For space, prefer orbiting planets. "
+            "Keep the narration extremely short."
         )
 
         LOGGER.info("Calling local Ollama model=%s for scene planning", self.config.ollama_model)
@@ -208,7 +218,7 @@ class OmniReelPipeline:
                     {"role": "user", "content": user_prompt},
                 ],
                 format="json",
-                options={"temperature": 0.45, "num_ctx": 4096},
+                options={"temperature": 0.1, "num_ctx": 1024, "num_predict": 180},
             )
         except Exception as exc:
             raise OmniReelError(
@@ -227,9 +237,9 @@ class OmniReelPipeline:
         return plan_path
 
     def generate_base_image(self, scene_plan: ScenePlan) -> Path:
-        """Generate a static base image from local Diffusers weights or QA fallback."""
+        """Generate a static base image from local Diffusers weights or procedural backend."""
         if self.config.qa_static_assets:
-            return self._generate_static_qa_image(scene_plan)
+            return self._generate_procedural_preview_image(scene_plan)
 
         LOGGER.info("Loading local Diffusers pipeline from %s", self.config.diffusion_model_path)
         import torch
@@ -292,46 +302,13 @@ class OmniReelPipeline:
                 del pipe
             self.purge_vram("diffusers_cleanup")
 
-    def _generate_static_qa_image(self, scene_plan: ScenePlan) -> Path:
-        """Create a deterministic local image without network/model weights for QA."""
-        from PIL import Image, ImageDraw, ImageFont
+    def _generate_procedural_preview_image(self, scene_plan: ScenePlan) -> Path:
+        from PIL import ImageFont
 
         output_path = self.config.output_dir / "base_image.png"
-        width = max(320, int(self.config.width))
-        height = max(320, int(self.config.height))
-        image = Image.new("RGB", (width, height), color=(28, 32, 40))
-        draw = ImageDraw.Draw(image)
-
-        title_font = _load_pillow_font(ImageFont, self.config.font_path, max(24, width // 20))
-        body_font = _load_pillow_font(ImageFont, self.config.font_path, max(16, width // 34))
-        small_font = _load_pillow_font(ImageFont, self.config.font_path, max(13, width // 44))
-
-        draw.rectangle([(0, 0), (width, height)], fill=(28, 32, 40))
-        draw.rectangle([(0, 0), (width, int(height * 0.16))], fill=(45, 56, 76))
-        draw.rectangle([(int(width * 0.08), int(height * 0.24)), (int(width * 0.92), int(height * 0.64))], outline=(120, 180, 255), width=4)
-
-        title_lines = _wrap_for_pillow(draw, scene_plan.title, title_font, int(width * 0.84))
-        y = int(height * 0.05)
-        for line in title_lines[:2]:
-            draw.text((int(width * 0.08), y), line, font=title_font, fill=(255, 255, 255))
-            y += _font_line_height(title_font) + 8
-
-        prompt = scene_plan.visual_prompt or scene_plan.style_notes
-        prompt_lines = _wrap_for_pillow(draw, prompt, body_font, int(width * 0.74))
-        y = int(height * 0.30)
-        for line in prompt_lines[:7]:
-            draw.text((int(width * 0.13), y), line, font=body_font, fill=(228, 238, 255))
-            y += _font_line_height(body_font) + 8
-
-        footer = "OmniReel QA static local image | Replace with local Diffusers model for production"
-        footer_lines = _wrap_for_pillow(draw, footer, small_font, int(width * 0.84))
-        y = int(height * 0.86)
-        for line in footer_lines[:2]:
-            draw.text((int(width * 0.08), y), line, font=small_font, fill=(180, 190, 205))
-            y += _font_line_height(small_font) + 6
-
+        image = self._draw_procedural_frame(scene_plan, progress=0.0, image_font_module=ImageFont)
         image.save(output_path)
-        LOGGER.info("QA static base image written: %s", output_path)
+        LOGGER.info("Procedural motion preview image written: %s", output_path)
         return output_path
 
     def synthesize_dialogue(self, dialogue: str) -> Path:
@@ -357,7 +334,7 @@ class OmniReelPipeline:
             import pyttsx3
 
             engine = pyttsx3.init()
-            engine.setProperty("rate", 165)
+            engine.setProperty("rate", 170)
             engine.setProperty("volume", 1.0)
             engine.save_to_file(text, str(output_path))
             engine.runAndWait()
@@ -377,42 +354,15 @@ class OmniReelPipeline:
         command = _format_command(self.config.piper_cmd, {"text_file": text_file, "output": output_path})
         _run_local_command(command, "Piper offline TTS")
 
-    def animate(self, image_path: Path, audio_path: Path) -> Path:
-        """Run local animation or deterministic FFmpeg static-video fallback."""
+    def animate(self, image_path: Path, audio_path: Path, scene_plan: ScenePlan) -> Path:
+        """Run local animation, external animation, or procedural motion."""
         _assert_file(image_path, "base image")
         _assert_file(audio_path, "dialogue audio")
         raw_video = self.config.output_dir / "raw_animated.mp4"
 
         if self.config.qa_static_assets:
-            command = [
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-loop",
-                "1",
-                "-framerate",
-                str(self.config.fps),
-                "-i",
-                str(image_path),
-                "-i",
-                str(audio_path),
-                "-c:v",
-                "libx264",
-                "-tune",
-                "stillimage",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "192k",
-                "-pix_fmt",
-                "yuv420p",
-                "-shortest",
-                str(raw_video),
-            ]
-            LOGGER.info("Running FFmpeg static-video QA animation fallback.")
-            _run_local_command(command, "FFmpeg static QA animation")
+            LOGGER.info("Running procedural local motion backend for %.2fs clip.", self.config.duration_seconds)
+            self._render_procedural_motion_video(scene_plan, audio_path, raw_video)
         else:
             command = _format_command(
                 self.config.liveportrait_cmd,
@@ -423,6 +373,158 @@ class OmniReelPipeline:
 
         _assert_file(raw_video, "raw animated video")
         return raw_video
+
+    def _render_procedural_motion_video(self, scene_plan: ScenePlan, audio_path: Path, output_path: Path) -> None:
+        from PIL import ImageFont
+
+        fps = max(1.0, float(self.config.fps))
+        duration = max(0.5, float(self.config.duration_seconds))
+        total_frames = max(2, int(round(fps * duration)))
+
+        with tempfile.TemporaryDirectory(prefix="omnireel_frames_") as tmp:
+            frame_dir = Path(tmp)
+            for index in range(total_frames):
+                progress = index / max(1, total_frames - 1)
+                frame = self._draw_procedural_frame(scene_plan, progress=progress, image_font_module=ImageFont)
+                frame.save(frame_dir / f"frame_{index + 1:05d}.png")
+
+            frame_pattern = frame_dir / "frame_%05d.png"
+            command = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-framerate",
+                _format_number(fps),
+                "-i",
+                str(frame_pattern),
+                "-i",
+                str(audio_path),
+                "-t",
+                _format_number(duration),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-crf",
+                "18",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-shortest",
+                str(output_path),
+            ]
+            _run_local_command(command, "procedural local motion render")
+
+    def _draw_procedural_frame(self, scene_plan: ScenePlan, progress: float, image_font_module: Any) -> Any:
+        from PIL import Image, ImageDraw
+
+        width = max(320, int(self.config.width))
+        height = max(320, int(self.config.height))
+        width += width % 2
+        height += height % 2
+        progress = min(1.0, max(0.0, progress))
+
+        theme = f"{scene_plan.title} {scene_plan.visual_prompt} {scene_plan.dialogue}".lower()
+        image = Image.new("RGB", (width, height), color=(18, 24, 34))
+        draw = ImageDraw.Draw(image)
+
+        if any(word in theme for word in ["gravity", "apple", "fall", "falling", "pull"]):
+            self._draw_gravity_scene(draw, image_font_module, scene_plan, width, height, progress)
+        elif any(word in theme for word in ["orbit", "planet", "sun", "space"]):
+            self._draw_orbit_scene(draw, image_font_module, scene_plan, width, height, progress)
+        else:
+            self._draw_generic_motion_scene(draw, image_font_module, scene_plan, width, height, progress)
+
+        return image
+
+    def _draw_gravity_scene(self, draw: Any, image_font_module: Any, scene_plan: ScenePlan, width: int, height: int, progress: float) -> None:
+        title_font = _load_pillow_font(image_font_module, self.config.font_path, max(26, width // 22))
+        small_font = _load_pillow_font(image_font_module, self.config.font_path, max(16, width // 46))
+
+        # Classroom background with parallax-like motion lines.
+        draw.rectangle([(0, 0), (width, height)], fill=(21, 29, 38))
+        draw.rectangle([(0, int(height * 0.72)), (width, height)], fill=(54, 39, 28))
+        for x in range(-width, width * 2, max(80, width // 8)):
+            x_shift = int((progress * width * 0.15) % max(80, width // 8))
+            draw.line([(x + x_shift, int(height * 0.72)), (x + x_shift + width // 5, height)], fill=(75, 55, 40), width=2)
+
+        board = (int(width * 0.08), int(height * 0.10), int(width * 0.92), int(height * 0.34))
+        draw.rounded_rectangle(board, radius=18, fill=(19, 74, 62), outline=(180, 215, 190), width=3)
+        title = scene_plan.title or "Gravity"
+        for line_index, line in enumerate(_wrap_for_pillow(draw, title, title_font, int(width * 0.74))[:2]):
+            draw.text((board[0] + 28, board[1] + 24 + line_index * (title_font.size + 8)), line, font=title_font, fill=(245, 255, 235))
+
+        # Simple teacher/kid figure.
+        cx = int(width * 0.22)
+        body_y = int(height * 0.62)
+        draw.ellipse([(cx - 42, body_y - 180), (cx + 42, body_y - 96)], fill=(178, 122, 75), outline=(40, 30, 25), width=2)
+        draw.rectangle([(cx - 46, body_y - 96), (cx + 46, body_y + 60)], fill=(70, 105, 180), outline=(30, 50, 100), width=2)
+        arm_angle = math.sin(progress * math.pi * 2) * 0.25
+        draw.line([(cx + 36, body_y - 55), (int(cx + width * 0.18), int(body_y - 120 + 40 * arm_angle))], fill=(178, 122, 75), width=12)
+
+        # Apple falling with acceleration, trail, and bounce hint.
+        top_y = int(height * 0.23)
+        bottom_y = int(height * 0.70)
+        fall = progress * progress
+        apple_x = int(width * 0.66 + math.sin(progress * math.pi * 2) * width * 0.03)
+        apple_y = int(top_y + (bottom_y - top_y) * fall)
+        for i in range(6):
+            trail_p = max(0.0, progress - i * 0.055)
+            trail_y = int(top_y + (bottom_y - top_y) * trail_p * trail_p)
+            alpha_color = (180 - i * 18, 70, 52)
+            r = max(5, int(width * 0.015) - i)
+            draw.ellipse([(apple_x - r, trail_y - r), (apple_x + r, trail_y + r)], fill=alpha_color)
+
+        apple_r = max(20, width // 26)
+        draw.ellipse([(apple_x - apple_r, apple_y - apple_r), (apple_x + apple_r, apple_y + apple_r)], fill=(210, 48, 38), outline=(95, 18, 18), width=3)
+        draw.ellipse([(apple_x - apple_r // 3, apple_y - apple_r // 2), (apple_x, apple_y - apple_r // 4)], fill=(245, 125, 105))
+        draw.line([(apple_x, apple_y - apple_r), (apple_x + apple_r // 3, apple_y - apple_r - apple_r // 2)], fill=(90, 52, 20), width=4)
+        draw.ellipse([(apple_x + apple_r // 4, apple_y - apple_r - apple_r // 2), (apple_x + apple_r, apple_y - apple_r // 2)], fill=(80, 160, 70))
+
+        arrow_x = int(width * 0.82)
+        draw.line([(arrow_x, top_y), (arrow_x, bottom_y)], fill=(255, 210, 90), width=6)
+        draw.polygon([(arrow_x - 18, bottom_y - 20), (arrow_x + 18, bottom_y - 20), (arrow_x, bottom_y + 20)], fill=(255, 210, 90))
+        draw.text((arrow_x - 64, bottom_y + 28), "pulls down", font=small_font, fill=(255, 225, 130))
+
+    def _draw_orbit_scene(self, draw: Any, image_font_module: Any, scene_plan: ScenePlan, width: int, height: int, progress: float) -> None:
+        title_font = _load_pillow_font(image_font_module, self.config.font_path, max(26, width // 24))
+        draw.rectangle([(0, 0), (width, height)], fill=(5, 8, 20))
+        for i in range(80):
+            x = (i * 97 + int(progress * 120)) % width
+            y = (i * 173) % height
+            draw.ellipse([(x, y), (x + 2, y + 2)], fill=(210, 220, 255))
+        cx, cy = width // 2, int(height * 0.48)
+        sun_r = max(36, width // 11)
+        draw.ellipse([(cx - sun_r, cy - sun_r), (cx + sun_r, cy + sun_r)], fill=(255, 190, 50), outline=(255, 230, 100), width=4)
+        for orbit_r, color, phase in [(int(width * 0.27), (90, 150, 255), 0.0), (int(width * 0.38), (110, 220, 160), 1.8)]:
+            draw.ellipse([(cx - orbit_r, cy - orbit_r), (cx + orbit_r, cy + orbit_r)], outline=(80, 95, 130), width=2)
+            angle = progress * math.tau + phase
+            px = int(cx + math.cos(angle) * orbit_r)
+            py = int(cy + math.sin(angle) * orbit_r)
+            pr = max(16, width // 32)
+            draw.ellipse([(px - pr, py - pr), (px + pr, py + pr)], fill=color, outline=(230, 240, 255), width=2)
+        for line_index, line in enumerate(_wrap_for_pillow(draw, scene_plan.title, title_font, int(width * 0.84))[:2]):
+            draw.text((int(width * 0.08), int(height * 0.07) + line_index * (title_font.size + 6)), line, font=title_font, fill=(245, 248, 255))
+
+    def _draw_generic_motion_scene(self, draw: Any, image_font_module: Any, scene_plan: ScenePlan, width: int, height: int, progress: float) -> None:
+        title_font = _load_pillow_font(image_font_module, self.config.font_path, max(26, width // 23))
+        draw.rectangle([(0, 0), (width, height)], fill=(22, 30, 48))
+        for i in range(10):
+            x = int((i * width * 0.16 + progress * width * 0.28) % width)
+            y = int(height * (0.20 + 0.05 * math.sin(i)))
+            draw.ellipse([(x - 14, y - 14), (x + 14, y + 14)], fill=(70, 120, 220))
+        for line_index, line in enumerate(_wrap_for_pillow(draw, scene_plan.title, title_font, int(width * 0.84))[:2]):
+            draw.text((int(width * 0.08), int(height * 0.08) + line_index * (title_font.size + 8)), line, font=title_font, fill=(255, 255, 255))
+        ball_x = int(width * (0.12 + 0.76 * progress))
+        ball_y = int(height * 0.58 + math.sin(progress * math.tau * 2) * height * 0.08)
+        radius = max(32, width // 14)
+        draw.ellipse([(ball_x - radius, ball_y - radius), (ball_x + radius, ball_y + radius)], fill=(240, 120, 70), outline=(255, 225, 190), width=4)
+        draw.line([(int(width * 0.10), int(height * 0.72)), (int(width * 0.90), int(height * 0.72))], fill=(100, 160, 255), width=5)
 
     def generate_subtitle_timings(self, dialogue: str, audio_path: Path) -> Path:
         """Generate Whisper-compatible subtitle timing JSON locally."""
@@ -444,7 +546,7 @@ class OmniReelPipeline:
             "No whisper_cmd configured. Writing deterministic heuristic timings; "
             "for production speech-accurate captions, pass a local whisper.cpp/faster-whisper command."
         )
-        payload = _build_heuristic_whisper_json(dialogue)
+        payload = _build_heuristic_whisper_json(dialogue, max_duration_seconds=self.config.duration_seconds)
         output_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
         return output_path
 
@@ -468,7 +570,7 @@ def _extract_ollama_content(response: Any) -> str:
 
 
 def _parse_json_object(content: str) -> Dict[str, Any]:
-    stripped = content.strip()
+    stripped = content.strip().lstrip("\ufeff")
     if stripped.startswith("```"):
         stripped = re.sub(r"^```(?:json)?\s*", "", stripped, flags=re.IGNORECASE)
         stripped = re.sub(r"\s*```$", "", stripped)
@@ -629,21 +731,29 @@ def _run_local_command(command: Sequence[str], label: str) -> None:
         LOGGER.debug("%s stderr: %s", label, completed.stderr[-2000:])
 
 
-def _build_heuristic_whisper_json(dialogue: str) -> Dict[str, Any]:
+def _build_heuristic_whisper_json(dialogue: str, max_duration_seconds: Optional[float] = None) -> Dict[str, Any]:
     words = re.findall(r"[\w'’-]+|[^\w\s]", _normalize_text(dialogue), flags=re.UNICODE)
     spoken_words = [word for word in words if re.search(r"\w", word)]
     if not spoken_words:
         raise ValueError("Cannot build subtitle timings from empty dialogue.")
 
-    seconds_per_word = 0.38
-    pause_every = 8
-    current = 0.0
+    pause_every = 5 if max_duration_seconds and max_duration_seconds <= 4 else 8
     timed_words: List[Dict[str, Any]] = []
-    for idx, word in enumerate(spoken_words):
-        start = current
-        end = start + seconds_per_word
-        timed_words.append({"word": word, "start": round(start, 3), "end": round(end, 3), "probability": 1.0})
-        current = end + (0.18 if (idx + 1) % pause_every == 0 else 0.04)
+    if max_duration_seconds:
+        usable = max(0.5, max_duration_seconds * 0.92)
+        slot = usable / max(1, len(spoken_words))
+        for idx, word in enumerate(spoken_words):
+            start = idx * slot
+            end = min(usable, start + slot * 0.82)
+            timed_words.append({"word": word, "start": round(start, 3), "end": round(end, 3), "probability": 1.0})
+    else:
+        seconds_per_word = 0.38
+        current = 0.0
+        for idx, word in enumerate(spoken_words):
+            start = current
+            end = start + seconds_per_word
+            timed_words.append({"word": word, "start": round(start, 3), "end": round(end, 3), "probability": 1.0})
+            current = end + (0.18 if (idx + 1) % pause_every == 0 else 0.04)
 
     segments: List[Dict[str, Any]] = []
     for idx in range(0, len(timed_words), pause_every):
@@ -660,3 +770,9 @@ def _build_heuristic_whisper_json(dialogue: str) -> Dict[str, Any]:
         )
 
     return {"text": _normalize_text(dialogue), "segments": segments, "language": "en", "source": "heuristic-local"}
+
+
+def _format_number(value: float) -> str:
+    if float(value).is_integer():
+        return str(int(value))
+    return f"{value:.3f}".rstrip("0").rstrip(".")
