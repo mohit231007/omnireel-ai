@@ -14,8 +14,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--topic", required=True)
     parser.add_argument("--output-dir", default="outputs/run", type=Path)
     parser.add_argument("--ollama-model", default="llama3.1:8b")
-    parser.add_argument("--diffusion-model", required=True, type=Path)
-    parser.add_argument("--liveportrait-cmd", required=True)
+    parser.add_argument("--diffusion-model", type=Path, default=None)
+    parser.add_argument("--liveportrait-cmd", default=None)
     parser.add_argument("--whisper-cmd", default=None)
     parser.add_argument("--font", type=Path, default=None)
     parser.add_argument("--tts-backend", choices=["pyttsx3", "piper"], default="pyttsx3")
@@ -44,14 +44,24 @@ def configure_logging(level: str) -> None:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     configure_logging(args.log_level)
+
+    if not args.skip_python_generation:
+        if args.diffusion_model is None:
+            parser.error("--diffusion-model is required unless --skip-python-generation is used")
+        if not args.liveportrait_cmd:
+            parser.error("--liveportrait-cmd is required unless --skip-python-generation is used")
+    elif args.existing_manifest is None:
+        parser.error("--existing-manifest is required when --skip-python-generation is used")
+
     try:
         pipeline_config = PipelineConfig(
             output_dir=args.output_dir,
             ollama_model=args.ollama_model,
-            diffusion_model_path=args.diffusion_model,
-            liveportrait_cmd=args.liveportrait_cmd,
+            diffusion_model_path=args.diffusion_model or Path("."),
+            liveportrait_cmd=args.liveportrait_cmd or "",
             whisper_cmd=args.whisper_cmd,
             font_path=args.font,
             tts_backend=args.tts_backend,
