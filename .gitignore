@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+
+# Rust build artifacts
+target/
+
+# Local generated media and manifests
+outputs/
+*.mp4
+*.wav
+*.png
+*.webm
+*.mov
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
