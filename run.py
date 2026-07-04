@@ -1,3 +1,3 @@
 import scripts.cli as cli
 
-cli.main()
+raise SystemExit(cli.main())
