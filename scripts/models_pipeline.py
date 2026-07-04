@@ -68,6 +68,7 @@ class PipelineConfig:
     duration_seconds: float = 3.0
     allow_remote_backends: bool = False
     qa_static_assets: bool = False
+    no_llm_planning: bool = False
 
 
 @dataclass(frozen=True)
@@ -159,7 +160,7 @@ class OmniReelPipeline:
 
         scene_plan = self.generate_scene_plan(topic)
         plan_path = self._write_scene_plan(scene_plan)
-        self.purge_vram("ollama_scene_plan")
+        self.purge_vram("scene_plan")
 
         base_image = self.generate_base_image(scene_plan)
         self.purge_vram("base_image")
@@ -188,9 +189,13 @@ class OmniReelPipeline:
         return manifest
 
     def generate_scene_plan(self, topic: str) -> ScenePlan:
-        """Ask a local Ollama model for a strict JSON scene plan with a deterministic local fallback."""
+        """Create a scene plan with optional Ollama planning and deterministic local fallback."""
         if not topic.strip():
             raise ValueError("topic must not be empty.")
+
+        if self.config.no_llm_planning:
+            LOGGER.info("Skipping Ollama planning because no_llm_planning=True.")
+            return _fallback_scene_plan(topic, self.config.duration_seconds)
 
         import ollama
 
